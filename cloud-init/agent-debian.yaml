@@ -1,0 +1,87 @@
+#cloud-config
+hostname: agent-debian
+manage_etc_hosts: true
+
+packages:
+
+* btrfs-progs
+* podman
+* uidmap
+* curl
+* systemd
+* systemd-sysv
+
+users:
+
+* name: agent
+  groups: [sudo]
+  sudo: ALL=(ALL) NOPASSWD:ALL
+  shell: /bin/bash
+
+write_files:
+
+* path: /etc/wsl.conf
+  content: |
+  [boot]
+  systemd=true
+  [user]
+  default=agent
+
+* path: /usr/local/bin/setup-btrfs.sh
+  permissions: '0755'
+  content: |
+  #!/bin/bash
+  set -e
+
+  DISK="/dev/sdc"   # adjust if needed
+
+  # Only run if not already formatted
+
+  if ! blkid $DISK; then
+  mkfs.btrfs -f -L agent-cow-store $DISK
+  fi
+
+  mkdir -p /mnt/btrfs-root
+  mount $DISK /mnt/btrfs-root
+
+  # Create subvolumes if they don't exist
+
+  if [ ! -d /mnt/btrfs-root/@workspaces ]; then
+  btrfs subvolume create /mnt/btrfs-root/@workspaces
+  btrfs subvolume create /mnt/btrfs-root/@podman
+  btrfs subvolume create /mnt/btrfs-root/@snapshots
+  fi
+
+  umount /mnt/btrfs-root
+
+  mkdir -p /mnt/agent-workspaces
+  mkdir -p /mnt/podman
+  mkdir -p /mnt/snapshots
+
+  mount -o compress=zstd:3,autodefrag,subvol=@workspaces $DISK /mnt/agent-workspaces
+  mount -o compress=zstd:3,subvol=@podman $DISK /mnt/podman
+  mount -o compress=zstd:3,subvol=@snapshots $DISK /mnt/snapshots
+
+  chown -R agent:agent /mnt/agent-workspaces /mnt/podman /mnt/snapshots
+
+  # Persist mounts
+
+  if ! grep -q agent-workspaces /etc/fstab; then
+  echo "$DISK /mnt/agent-workspaces btrfs compress=zstd:3,autodefrag,subvol=@workspaces 0 0" >> /etc/fstab
+  echo "$DISK /mnt/podman btrfs compress=zstd:3,subvol=@podman 0 0" >> /etc/fstab
+  echo "$DISK /mnt/snapshots btrfs compress=zstd:3,subvol=@snapshots 0 0" >> /etc/fstab
+  fi
+
+* path: /etc/containers/storage.conf
+  content: |
+  [storage]
+  driver = "btrfs"
+  graphroot = "/mnt/podman"
+  runroot = "/run/user/1000/containers"
+
+runcmd:
+
+* echo "agent:100000:65536" >> /etc/subuid
+* echo "agent:100000:65536" >> /etc/subgid
+* bash /usr/local/bin/setup-btrfs.sh
+

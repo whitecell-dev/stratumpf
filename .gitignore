@@ -1,0 +1,59 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+.Python
+env/
+venv/
+.venv/
+env.bak/
+venv.bak/
+.installed.cfg
+*.egg-info/
+.dist/
+.build/
+.wheel/
+
+# Pytest / coverage
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+.tox/
+.nox/
+
+# Jupyter / IPython
+.ipynb_checkpoints
+*.ipynb_checkpoints
+
+# IDEs
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+
+# Project specific: never commit actual agent workspaces or snapshots
+/mnt/agent-workspaces/
+/mnt/agent-snapshots/
+agent-workspaces/
+agent-snapshots/
+*.btrfs
+
+# Logs and temp files
+*.log
+*.tmp
+*.temp
+*.bak
+
+# Ollama / model files
+models/
+*.gguf
+
+# Environment files
+.env
+.env.*
