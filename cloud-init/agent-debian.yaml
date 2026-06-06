@@ -1,87 +1,104 @@
 #cloud-config
+
 hostname: agent-debian
 manage_etc_hosts: true
 
 packages:
-
-* btrfs-progs
-* podman
-* uidmap
-* curl
-* systemd
-* systemd-sysv
+    - btrfs-progs
+    - podman
+    - uidmap
+    - curl
+    - systemd
+    - systemd-sysv
 
 users:
-
-* name: agent
-  groups: [sudo]
-  sudo: ALL=(ALL) NOPASSWD:ALL
-  shell: /bin/bash
+    - name: agent
+    groups: [sudo]
+    sudo: ALL=(ALL) NOPASSWD:ALL
+    shell: /bin/bash
 
 write_files:
+    - path: /etc/wsl.conf
+    content: |
+      [boot]
+      systemd=true
+      [user]
+      default=agent
 
-* path: /etc/wsl.conf
-  content: |
-  [boot]
-  systemd=true
-  [user]
-  default=agent
+    - path: /usr/local/bin/setup-btrfs.sh
+    permissions: '0755'
+    content: |
+      #!/bin/bash
+      set -euo pipefail
 
-* path: /usr/local/bin/setup-btrfs.sh
-  permissions: '0755'
-  content: |
-  #!/bin/bash
-  set -e
+      # Prefer MODEL match over size to avoid ambiguity
+      DISK=$(lsblk -dpno NAME,SIZE,MODEL | awk '/Virtual Disk/ && $2 ~ /50G/ {print $1; exit}')
 
-  DISK="/dev/sdc"   # adjust if needed
+      if [ -z "$DISK" ]; then
+        echo "ERROR: Could not find disk with MODEL 'Virtual Disk' and size ~50G."
+        echo "Check lsblk -dpno NAME,SIZE,MODEL and adjust the filter."
+        exit 1
+      fi
 
-  # Only run if not already formatted
+      echo "Using disk: $DISK"
 
-  if ! blkid $DISK; then
-  mkfs.btrfs -f -L agent-cow-store $DISK
-  fi
+      # Format only if no btrfs signature exists
+      if! blkid -s TYPE -o value "$DISK" | grep -q btrfs; then
+        echo "Formatting $DISK as Btrfs..."
+        mkfs.btrfs -f -L agent-cow-store "$DISK"
+      else
+        echo "Btrfs signature already present on $DISK, skipping format."
+      fi
 
-  mkdir -p /mnt/btrfs-root
-  mount $DISK /mnt/btrfs-root
+      # Mount root temporarily to create subvolumes
+      mkdir -p /mnt/btrfs-root
+      mount "$DISK" /mnt/btrfs-root
 
-  # Create subvolumes if they don't exist
+      for subvol in @workspaces @snapshots @podman; do
+        if! btrfs subvolume show "/mnt/btrfs-root/$subvol" &>/dev/null; then
+          echo "Creating subvolume: $subvol"
+          btrfs subvolume create "/mnt/btrfs-root/$subvol"
+        fi
+      done
 
-  if [ ! -d /mnt/btrfs-root/@workspaces ]; then
-  btrfs subvolume create /mnt/btrfs-root/@workspaces
-  btrfs subvolume create /mnt/btrfs-root/@podman
-  btrfs subvolume create /mnt/btrfs-root/@snapshots
-  fi
+      umount /mnt/btrfs-root
 
-  umount /mnt/btrfs-root
+      # Mount subvolumes with noatime to reduce CoW write amplification
+      mkdir -p /mnt/agent-workspaces
+      mount -o noatime,compress=zstd:3,autodefrag,subvol=@workspaces "$DISK" /mnt/agent-workspaces
 
-  mkdir -p /mnt/agent-workspaces
-  mkdir -p /mnt/podman
-  mkdir -p /mnt/snapshots
+      mkdir -p /mnt/agent-workspaces/snapshots
+      mount -o noatime,compress=zstd:3,subvol=@snapshots "$DISK" /mnt/agent-workspaces/snapshots
 
-  mount -o compress=zstd:3,autodefrag,subvol=@workspaces $DISK /mnt/agent-workspaces
-  mount -o compress=zstd:3,subvol=@podman $DISK /mnt/podman
-  mount -o compress=zstd:3,subvol=@snapshots $DISK /mnt/snapshots
+      mkdir -p /mnt/agent-workspaces/podman
+      mount -o noatime,compress=zstd:3,subvol=@podman "$DISK" /mnt/agent-workspaces/podman
 
-  chown -R agent:agent /mnt/agent-workspaces /mnt/podman /mnt/snapshots
+      # Create initial workspace and make active a symlink for atomic swaps
+      mkdir -p /mnt/agent-workspaces/workspaces/run-000
+      chown -R agent:agent /mnt/agent-workspaces
+      ln -sf /mnt/agent-workspaces/workspaces/run-000 /mnt/agent-workspaces/active
 
-  # Persist mounts
+      # Persist mounts using UUID, not device name
+      DISK_UUID=$(blkid -s UUID -o value "$DISK")
 
-  if ! grep -q agent-workspaces /etc/fstab; then
-  echo "$DISK /mnt/agent-workspaces btrfs compress=zstd:3,autodefrag,subvol=@workspaces 0 0" >> /etc/fstab
-  echo "$DISK /mnt/podman btrfs compress=zstd:3,subvol=@podman 0 0" >> /etc/fstab
-  echo "$DISK /mnt/snapshots btrfs compress=zstd:3,subvol=@snapshots 0 0" >> /etc/fstab
-  fi
+      if! grep -q "$DISK_UUID" /etc/fstab; then
+        echo "UUID=$DISK_UUID /mnt/agent-workspaces btrfs noatime,compress=zstd:3,autodefrag,subvol=@workspaces 0 0" >> /etc/fstab
+        echo "UUID=$DISK_UUID /mnt/agent-workspaces/snapshots btrfs noatime,compress=zstd:3,subvol=@snapshots 0 0" >> /etc/fstab
+        echo "UUID=$DISK_UUID /mnt/agent-workspaces/podman btrfs noatime,compress=zstd:3,subvol=@podman 0 0" >> /etc/fstab
+      fi
 
-* path: /etc/containers/storage.conf
-  content: |
-  [storage]
-  driver = "btrfs"
-  graphroot = "/mnt/podman"
-  runroot = "/run/user/1000/containers"
+    - path: /etc/containers/storage.conf
+    content: |
+      [storage]
+      driver = "btrfs"
+      graphroot = "/mnt/agent-workspaces/podman"
+      runroot = "/run/user/1000/containers"
+
+      [storage.options]
+      mountopt = "compress=zstd:3"
 
 runcmd:
-
-* echo "agent:100000:65536" >> /etc/subuid
-* echo "agent:100000:65536" >> /etc/subgid
-* bash /usr/local/bin/setup-btrfs.sh
-
+  # Idempotent subuid/subgid setup
+    - grep -q "^agent:" /etc/subuid || echo "agent:100000:65536" >> /etc/subuid
+    - grep -q "^agent:" /etc/subgid || echo "agent:100000:65536" >> /etc/subgid
+    - bash /usr/local/bin/setup-btrfs.sh
